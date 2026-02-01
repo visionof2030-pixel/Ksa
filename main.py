@@ -1,26 +1,18 @@
-import os
-import sqlite3
-import random
-import string
-import datetime
-import jwt
-
+import os, json, random, string, datetime, jwt
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 
-# ======================
-# ENV
-# ======================
-JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_SECRET")
+# ================== CONFIG ==================
+JWT_SECRET = os.getenv("JWT_SECRET")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")
+CODE_DAYS = 30
+CODES_FILE = "codes.json"
 
-DB_FILE = "activation.db"
-CODE_EXPIRY_DAYS = 30
+if not JWT_SECRET or not ADMIN_TOKEN:
+    raise RuntimeError("Missing ENV variables")
 
-# ======================
-# APP
-# ======================
-app = FastAPI(title="AI Activation Server")
+# ================== APP ==================
+app = FastAPI(title="Activation Server")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,27 +21,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ======================
-# DB INIT
-# ======================
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS activation_codes (
-            code TEXT PRIMARY KEY,
-            expires_at TEXT,
-            used INTEGER DEFAULT 0
-        )
-    """)
-    conn.commit()
-    conn.close()
+# ================== HELPERS ==================
+def load_codes():
+    if not os.path.exists(CODES_FILE):
+        return {}
+    with open(CODES_FILE, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-init_db()
+def save_codes(data):
+    with open(CODES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
 
-# ======================
-# HELPERS
-# ======================
 def generate_short_code(length=6):
     chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(random.choice(chars) for _ in range(length))
@@ -57,105 +39,84 @@ def generate_short_code(length=6):
 def create_jwt():
     payload = {
         "type": "activation",
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=CODE_EXPIRY_DAYS)
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=CODE_DAYS)
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-def verify_jwt(token: str):
-    try:
-        jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-
-# ======================
-# MODELS
-# ======================
-class ActivateRequest(BaseModel):
-    code: str
-
-class AskRequest(BaseModel):
-    prompt: str
-
-# ======================
-# ROUTES
-# ======================
-
+# ================== ROUTES ==================
 @app.get("/")
 def health():
     return {"status": "ok"}
 
-# ---------- إنشاء كود تفعيل قصير ----------
+# -------- ADMIN: CREATE CODE --------
 @app.get("/admin/create-code")
-def create_code():
-    code = generate_short_code()
-    expires = (datetime.datetime.utcnow() + datetime.timedelta(days=CODE_EXPIRY_DAYS)).isoformat()
+def create_code(key: str):
+    if key != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO activation_codes (code, expires_at) VALUES (?, ?)",
-        (code, expires)
-    )
-    conn.commit()
-    conn.close()
+    codes = load_codes()
+
+    code = generate_short_code()
+    while code in codes:
+        code = generate_short_code()
+
+    expires = (datetime.datetime.utcnow() + datetime.timedelta(days=CODE_DAYS)).isoformat()
+
+    codes[code] = {
+        "used": False,
+        "expires": expires
+    }
+    save_codes(codes)
 
     return {
         "activation_code": code,
-        "expires_in": f"{CODE_EXPIRY_DAYS} days"
+        "expires_in": f"{CODE_DAYS} days"
     }
 
-# ---------- تفعيل الكود (تحويله إلى JWT) ----------
-@app.post("/activate")
-def activate(data: ActivateRequest):
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
+# -------- ADMIN: LIST CODES --------
+@app.get("/admin/codes")
+def list_codes(key: str):
+    if key != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
+    return load_codes()
 
-    cur.execute(
-        "SELECT expires_at, used FROM activation_codes WHERE code = ?",
-        (data.code.strip().upper(),)
-    )
-    row = cur.fetchone()
+# -------- VERIFY SHORT CODE (ONE TIME) --------
+@app.post("/verify")
+def verify_code(x_code: str = Header(..., alias="X-Code")):
+    codes = load_codes()
 
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=401, detail="Invalid code")
+    if x_code not in codes:
+        raise HTTPException(status_code=401, detail="INVALID_CODE")
 
-    expires_at, used = row
+    record = codes[x_code]
 
-    if used:
-        conn.close()
-        raise HTTPException(status_code=401, detail="Code already used")
+    if record["used"]:
+        raise HTTPException(status_code=401, detail="CODE_ALREADY_USED")
 
-    if datetime.datetime.fromisoformat(expires_at) < datetime.datetime.utcnow():
-        conn.close()
-        raise HTTPException(status_code=401, detail="Code expired")
+    if datetime.datetime.utcnow() > datetime.datetime.fromisoformat(record["expires"]):
+        raise HTTPException(status_code=401, detail="CODE_EXPIRED")
 
-    # نعلّم الكود كمستخدم
-    cur.execute(
-        "UPDATE activation_codes SET used = 1 WHERE code = ?",
-        (data.code.strip().upper(),)
-    )
-    conn.commit()
-    conn.close()
+    # mark as used
+    codes[x_code]["used"] = True
+    save_codes(codes)
 
     token = create_jwt()
 
     return {
         "token": token,
-        "expires_in": f"{CODE_EXPIRY_DAYS} days"
+        "expires_in": f"{CODE_DAYS} days"
     }
 
-# ---------- الذكاء الاصطناعي ----------
+# -------- PROTECTED AI ENDPOINT --------
 @app.post("/generate")
-def generate(
-    data: AskRequest,
-    x_token: str = Header(..., alias="X-Token")
-):
-    verify_jwt(x_token)
+def generate(x_token: str = Header(..., alias="X-Token")):
+    try:
+        payload = jwt.decode(x_token, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("type") != "activation":
+            raise Exception()
+    except:
+        raise HTTPException(status_code=401, detail="INVALID_TOKEN")
 
-    # 🔹 هنا منطق Gemini / AI الحقيقي
     return {
-        "answer": f"✅ تم التوليد بنجاح\n\n{data.prompt}"
+        "answer": "تم التحقق بنجاح – الذكاء الاصطناعي يعمل"
     }
