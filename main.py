@@ -1,42 +1,24 @@
 import os
 import random
-import string
 import datetime
 import jwt
-import google.generativeai as genai
 
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
 # ======================
-# ENV
+# CONFIG
 # ======================
-JWT_SECRET = os.getenv("JWT_SECRET")          # مثال: supersecretjwt
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN")        # مثال: admin123
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_ME_SECRET")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "ADMIN123")
 
-if not JWT_SECRET or not ADMIN_TOKEN:
-    raise RuntimeError("JWT_SECRET or ADMIN_TOKEN missing")
-
-# ✅ 7 مفاتيح Gemini
-GEMINI_KEYS = [
-    os.getenv("GEMINI_API_KEY_1"),
-    os.getenv("GEMINI_API_KEY_2"),
-    os.getenv("GEMINI_API_KEY_3"),
-    os.getenv("GEMINI_API_KEY_4"),
-    os.getenv("GEMINI_API_KEY_5"),
-    os.getenv("GEMINI_API_KEY_6"),
-    os.getenv("GEMINI_API_KEY_7"),
-]
-GEMINI_KEYS = [k for k in GEMINI_KEYS if k]
-
-if not GEMINI_KEYS:
-    raise RuntimeError("No Gemini API Keys found")
+CODE_EXPIRY_DAYS = 30
 
 # ======================
 # APP
 # ======================
-app = FastAPI(title="Educational AI Tool")
+app = FastAPI(title="Activation Server")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,30 +28,21 @@ app.add_middleware(
 )
 
 # ======================
-# MODELS
-# ======================
-class AskRequest(BaseModel):
-    prompt: str
-
-# ======================
 # HELPERS
 # ======================
-def pick_gemini_model():
-    key = random.choice(GEMINI_KEYS)
-    genai.configure(api_key=key)
-    return genai.GenerativeModel("models/gemini-2.5-flash-lite")
-
 def generate_short_code(length=6):
-    chars = string.ascii_uppercase + string.digits
+    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
     return "".join(random.choice(chars) for _ in range(length))
 
-def create_jwt_from_code(code: str):
+
+def jwt_from_code(code: str):
     payload = {
         "type": "activation",
         "code": code,
-        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=30)
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=CODE_EXPIRY_DAYS)
     }
     return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
 
 def verify_jwt(token: str):
     try:
@@ -87,49 +60,35 @@ def verify_jwt(token: str):
 # ======================
 @app.get("/")
 def health():
-    return {
-        "status": "ok",
-        "time": datetime.datetime.utcnow().isoformat()
-    }
+    return {"status": "ok"}
 
-# ----------------------
-# توليد كود تفعيل قصير (للمشرف فقط)
-# ----------------------
+# 🔑 توليد كود قصير (للمشرف فقط)
 @app.get("/generate-code")
 def generate_code(key: str):
     if key != ADMIN_TOKEN:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    short_code = generate_short_code()
-    token = create_jwt_from_code(short_code)
-
+    code = generate_short_code()
     return {
-        "activation_code": short_code,   # الكود القصير للمستخدم
-        "token": token,                  # JWT الداخلي
-        "expires_in": "30 days"
+        "activation_code": code,
+        "expires_in": f"{CODE_EXPIRY_DAYS} days"
     }
 
-# ----------------------
-# التحقق من التفعيل
-# ----------------------
+# ✅ تفعيل (الكود القصير → JWT)
+@app.post("/activate")
+def activate(code: str):
+    if not code or len(code) < 4:
+        raise HTTPException(status_code=400, detail="Invalid code")
+
+    token = jwt_from_code(code)
+
+    return {
+        "token": token,
+        "expires_in": f"{CODE_EXPIRY_DAYS} days"
+    }
+
+# ✅ تحقق من JWT
 @app.get("/verify")
 def verify(x_token: str = Header(..., alias="X-Token")):
     verify_jwt(x_token)
-    return {"status": "ok"}
-
-# ----------------------
-# توليد الرد بالذكاء الاصطناعي
-# ----------------------
-@app.post("/generate")
-def generate(
-    data: AskRequest,
-    x_token: str = Header(..., alias="X-Token")
-):
-    verify_jwt(x_token)
-
-    try:
-        model = pick_gemini_model()
-        response = model.generate_content(data.prompt)
-        return {"answer": response.text}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return {"status": "valid"}
