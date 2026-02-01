@@ -1,94 +1,132 @@
-import express from "express";
-import cors from "cors";
-import jwt from "jsonwebtoken";
+import os
+import random
+import datetime
+import jwt
 
-const app = express();
-app.use(cors());
-app.use(express.json());
+from fastapi import FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
-/* ================== الإعدادات ================== */
-const PORT = process.env.PORT || 3000;
-const JWT_SECRET = "CHANGE_THIS_SECRET_123"; // غيّره
-const CODE_EXPIRY_DAYS = 30;
+# ======================
+# ENV
+# ======================
+JWT_SECRET = os.getenv("JWT_SECRET", "CHANGE_THIS_SECRET")
+ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "ADMIN_KEY")
 
-/* ================== توليد كود قصير ================== */
-function generateShortCode() {
-  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  let code = "";
-  for (let i = 0; i < 6; i++) {
-    code += chars[Math.floor(Math.random() * chars.length)];
-  }
-  return code;
-}
+# ======================
+# APP
+# ======================
+app = FastAPI(title="Educational AI Tool")
 
-/* ================== توليد كود تفعيل (مرة واحدة) ================== */
-/*
-  استخدم هذا فقط عند البيع أو الإنشاء
-  شغّله يدويًا ثم خزّن الكود عندك
-*/
-app.get("/generate", (req, res) => {
-  const shortCode = generateShortCode();
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-  const token = jwt.sign(
-    {
-      type: "activation",
-      code: shortCode
-    },
-    JWT_SECRET,
-    { expiresIn: `${CODE_EXPIRY_DAYS}d` }
-  );
+# ======================
+# STORAGE (Short Codes)
+# ======================
+# { "ABC123": datetime }
+SHORT_CODES = {}
 
-  res.json({
-    activation_code: shortCode,
-    expires_in: `${CODE_EXPIRY_DAYS} days`
-  });
-});
+# ======================
+# MODELS
+# ======================
+class AskRequest(BaseModel):
+    prompt: str
 
-/* ================== التحقق من التفعيل ================== */
-app.get("/verify", (req, res) => {
-  const code = req.headers["x-token"];
+# ======================
+# HELPERS
+# ======================
+def generate_short_code(length=6):
+    chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    return "".join(random.choice(chars) for _ in range(length))
 
-  if (!code) {
-    return res.status(401).json({ error: "NO_CODE" });
-  }
+def create_jwt(expiry: datetime.datetime):
+    payload = {
+        "type": "activation",
+        "exp": expiry
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
 
-  try {
-    // نفك التوكن الأصلي
-    const decoded = jwt.verify(code, JWT_SECRET);
+def verify_jwt(token: str):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
+        if payload.get("type") != "activation":
+            raise HTTPException(status_code=401, detail="Invalid token type")
+        return payload
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Activation expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
 
-    if (decoded.type !== "activation") {
-      return res.status(403).json({ error: "INVALID_TYPE" });
+# ======================
+# ROUTES
+# ======================
+@app.get("/")
+def health():
+    return {
+        "status": "ok",
+        "time": datetime.datetime.utcnow().isoformat()
     }
 
-    res.json({
-      status: "valid"
-    });
+# --------------------------------------------------
+# توليد كود تفعيل قصير (للإدارة فقط)
+# --------------------------------------------------
+@app.get("/easy-code")
+def easy_code(key: str):
+    if key != ADMIN_TOKEN:
+        raise HTTPException(status_code=403, detail="Forbidden")
 
-  } catch (err) {
-    return res.status(403).json({ error: "INVALID_OR_EXPIRED" });
-  }
-});
+    short_code = generate_short_code()
+    expiry = datetime.datetime.utcnow() + datetime.timedelta(days=30)
 
-/* ================== API الذكاء الاصطناعي ================== */
-app.post("/generate", (req, res) => {
-  const token = req.headers["x-token"];
-  if (!token) {
-    return res.status(401).json({ error: "NOT_ACTIVATED" });
-  }
+    SHORT_CODES[short_code] = expiry
 
-  try {
-    jwt.verify(token, JWT_SECRET);
-  } catch {
-    return res.status(403).json({ error: "INVALID_TOKEN" });
-  }
+    return {
+        "activation_code": short_code,
+        "expires_in": "30 days"
+    }
 
-  // 🔹 هنا ضع منطق الذكاء الاصطناعي الخاص بك
-  res.json({
-    answer: "نص تجريبي صادر من الذكاء الاصطناعي"
-  });
-});
+# --------------------------------------------------
+# التحقق من كود التفعيل (يُستخدم في صفحة التفعيل)
+# --------------------------------------------------
+@app.get("/verify")
+def verify_activation(x_token: str = Header(None, alias="X-Token")):
+    if not x_token:
+        raise HTTPException(status_code=401, detail="Missing activation code")
 
-/* ================== تشغيل السيرفر ================== */
-app.listen(PORT, () => {
-  console.log(`✅ Server running on port ${PORT}`);
-});
+    expiry = SHORT_CODES.get(x_token)
+
+    if not expiry:
+        raise HTTPException(status_code=401, detail="Invalid activation code")
+
+    if datetime.datetime.utcnow() > expiry:
+        del SHORT_CODES[x_token]
+        raise HTTPException(status_code=401, detail="Activation code expired")
+
+    jwt_token = create_jwt(expiry)
+
+    return {
+        "token": jwt_token
+    }
+
+# --------------------------------------------------
+# توليد الرد (محمي بالتفعيل)
+# --------------------------------------------------
+@app.post("/generate")
+def generate(
+    data: AskRequest,
+    x_token: str = Header(None, alias="X-Token")
+):
+    if not x_token:
+        raise HTTPException(status_code=401, detail="Not activated")
+
+    verify_jwt(x_token)
+
+    # 🔹 ضع منطق الذكاء الاصطناعي هنا
+    return {
+        "answer": f"تم استلام الطلب بنجاح. النص: {data.prompt}"
+    }
